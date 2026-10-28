@@ -149,7 +149,7 @@ def session_drift(bars, mode="both", long_start=23, long_hours=3, short_start=13
     side[:200] = 0
     hold = (np.where(side > 0, long_hours, short_hours) * (pd.Timedelta(hours=1) / step)).astype(int)
     # one Signals object needs one max_bars: encode per-trade hold via flat bars
-    flat = np.append((idx[1:] - idx[:-1]) > pd.Timedelta(minutes=30), True)
+    flat = np.append((idx[1:] - idx[:-1]) > max(pd.Timedelta(minutes=30), 2 * step), True)
     exit_bars = np.zeros(len(bars), bool)
     for i in np.flatnonzero(side):
         j = i + hold[i]
@@ -207,7 +207,7 @@ def ny_fade(bars, ref="london", entry="09:30", exit_="15:55", min_move_atr=0.0, 
     short_ = sig_bar & big & (move > 0).to_numpy()
     side = np.where(long_, 1, np.where(short_, -1, 0))
     side[:200] = 0
-    flat = np.append((bars.index[1:] - bars.index[:-1]) > pd.Timedelta(minutes=30), True)
+    flat = np.append((bars.index[1:] - bars.index[:-1]) > max(pd.Timedelta(minutes=30), 2 * bar_delta(bars)), True)
     return Signals(side=side, sl_dist=a.to_numpy() * sl_atr, tp_dist=a.to_numpy() * tp_atr,
                    max_bars=10_000, flat=flat | exit_bar)
 
@@ -287,8 +287,22 @@ def vol_breakout(bars, open_ref="globex", k=0.5, exit_="15:55", sl_atr=10.0, tp_
     side = np.where(long_, 1, np.where(short_, -1, 0))
     side[:300] = 0
     exit_bar = crosses(ny, nxt, xh, xm)
-    flat = np.append((bars.index[1:] - bars.index[:-1]) > pd.Timedelta(minutes=30), True)
+    flat = np.append((bars.index[1:] - bars.index[:-1]) > max(pd.Timedelta(minutes=30), 2 * bar_delta(bars)), True)
     return Signals(side=side, sl_dist=a * sl_atr, tp_dist=a * tp_atr, max_bars=10_000, flat=flat | exit_bar)
+
+
+def tsmom(bars, lookback=50, hold=5, mode="both", sl_atr=3.0, tp_atr=1000.0):
+    """Time-series momentum on daily bars: go with the sign of the `lookback`-day
+    return, hold `hold` days (ATR stop), re-decide after each exit."""
+    c = mid(bars, "close")
+    ret = c / c.shift(lookback) - 1
+    long_ = (ret > 0).to_numpy()
+    short_ = (ret < 0).to_numpy() if mode == "both" else np.zeros(len(bars), bool)
+    side = np.where(long_, 1, np.where(short_, -1, 0))
+    side[: max(lookback, 20)] = 0
+    a = atr(bars).to_numpy()
+    flat = np.append((bars.index[1:] - bars.index[:-1]) > pd.Timedelta(days=5), True)
+    return Signals(side=side, sl_dist=a * sl_atr, tp_dist=a * tp_atr, max_bars=hold, flat=flat)
 
 
 STRATEGIES = {
@@ -302,6 +316,7 @@ STRATEGIES = {
     "asian_range": asian_range,
     "prev_day_levels": prev_day_levels,
     "vol_breakout": vol_breakout,
+    "tsmom": tsmom,
 }
 
 _EXITS = {"sl_atr": [1.0, 1.5, 2.0], "tp_atr": [1.0, 1.5, 2.0, 3.0], "max_bars": [12, 24, 48]}
@@ -321,5 +336,7 @@ GRIDS = {
     "prev_day_levels": {"mode": ["break", "fade"], **_EXITS},
     "vol_breakout": {"open_ref": ["globex", "london"], "k": [0.2, 0.3, 0.5, 0.7], "exit_": ["12:00", "15:55"],
                      "sl_atr": [5.0, 10.0, 20.0], "tp_atr": [1000.0]},
+    "tsmom": {"lookback": [10, 20, 50, 100, 200], "hold": [1, 5, 10, 20], "mode": ["long", "both"],
+              "sl_atr": [2.0, 3.0, 5.0], "tp_atr": [1000.0]},
     "trend_dip": {"trend_days": [10, 20, 50], "rsi_n": [7, 14], "rsi_lvl": [25, 30, 35, 40], **_EXITS},
 }
