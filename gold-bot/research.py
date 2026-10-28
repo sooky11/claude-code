@@ -264,11 +264,13 @@ def main() -> None:
     ap.add_argument("--report", default=str(Path(__file__).parent / "report.html"))
     ap.add_argument("--strategies", nargs="*", default=list(STRATEGIES))
     ap.add_argument("--rule", default="5min", help="bar size: 5min, 15min, 1h")
+    ap.add_argument("--start", default="2025-10-27", help="first day of the research period")
+    ap.add_argument("--end", default=None, help="last day of the research period")
     ap.add_argument("--entry-hours", default="7-19", help="UTC hours for new entries, e.g. 13-16")
     a = ap.parse_args()
 
     strategies.ENTRY_HOURS = tuple(int(h) for h in a.entry_hours.split("-"))
-    bars = data.load_bars(rule=a.rule)
+    bars = data.load_bars(a.start, a.end, rule=a.rule)
     flat = flat_mask(bars, bar_minutes=int(pd.Timedelta(a.rule).total_seconds() // 60))
     holdout_start = (bars.index[-1] - pd.Timedelta(days=a.holdout_days)).normalize()
     results = [evaluate(n, bars, flat, holdout_start) for n in a.strategies]

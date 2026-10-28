@@ -31,6 +31,7 @@ class Signals:
     sl_dist: np.ndarray   # stop distance in $/oz
     tp_dist: np.ndarray   # target distance in $/oz
     max_bars: int = 24    # time stop in bars
+    flat: np.ndarray | None = None  # strategy-specific forced-exit bars (overrides the default)
 
 
 def apply_costs(bars: pd.DataFrame, costs: Costs) -> dict[str, np.ndarray]:
@@ -44,6 +45,8 @@ def apply_costs(bars: pd.DataFrame, costs: Costs) -> dict[str, np.ndarray]:
 
 
 def run(bars: pd.DataFrame, sig: Signals, flat: np.ndarray, costs: Costs = Costs()) -> pd.DataFrame:
+    if sig.flat is not None:
+        flat = sig.flat
     p = apply_costs(bars, costs)
     bo, bh, bl, bc = p["bid_open"], p["bid_high"], p["bid_low"], p["bid_close"]
     ao, ah, al, ac = p["ask_open"], p["ask_high"], p["ask_low"], p["ask_close"]
