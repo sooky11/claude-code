@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import lzma
+import os
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -69,7 +70,7 @@ def fetch_day_candles(day: date) -> pd.DataFrame | None:
         raw = fetch(_url(day, f"{side}_candles_min_1.bi5"))
         if raw is None:
             return None
-        a = np.frombuffer(raw, dtype=CANDLE)
+        a = np.frombuffer(raw, dtype=CANDLE).astype(CANDLE.newbyteorder("="))
         idx = pd.Timestamp(day, tz="UTC") + pd.to_timedelta(a["t"].astype(np.int64), unit="s")
         s = side.lower()
         sides[s] = pd.DataFrame({f"{s}_open": a["o"] / POINT, f"{s}_high": a["h"] / POINT,
@@ -86,7 +87,7 @@ def fetch_hour_ticks(day: date, hour: int) -> pd.DataFrame:
     raw = fetch(_url(day, f"{hour:02d}h_ticks.bi5"))
     if not raw:
         return pd.DataFrame()
-    a = np.frombuffer(raw, dtype=TICK)
+    a = np.frombuffer(raw, dtype=TICK).astype(TICK.newbyteorder("="))
     base = pd.Timestamp(datetime(day.year, day.month, day.day, hour, tzinfo=timezone.utc))
     idx = base + pd.to_timedelta(a["ms"].astype(np.int64), unit="ms")
     return pd.DataFrame({"ask": a["ask"] / POINT, "bid": a["bid"] / POINT}, index=idx)
@@ -130,6 +131,42 @@ def download(start: date, end: date) -> None:
             print(f"  {i}/{len(days)} days", flush=True)
 
 
+OANDA_URL = "https://api-fxpractice.oanda.com/v3/instruments/XAU_USD/candles"
+
+
+def download_oanda(start: date, end: date) -> None:
+    """Alternative source: OANDA v20 practice API (needs OANDA_API_KEY)."""
+    key = os.environ.get("OANDA_API_KEY")
+    if not key:
+        raise SystemExit("Set OANDA_API_KEY (OANDA demo account -> Manage API Access).")
+    headers = {"Authorization": f"Bearer {key}"}
+    t = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+    stop = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1)
+    rows = []
+    while t < stop:
+        params = {"granularity": "M1", "price": "BA", "count": 5000,
+                  "from": t.strftime("%Y-%m-%dT%H:%M:%SZ"), "includeFirst": "true"}
+        r = _session.get(OANDA_URL, headers=headers, params=params, timeout=60)
+        r.raise_for_status()
+        candles = [c for c in r.json()["candles"] if c["complete"]]
+        if not candles:
+            break
+        for c in candles:
+            rows.append((c["time"], *(float(c[s][f]) for s in ("bid", "ask") for f in "ohlc"), c["volume"]))
+        last = pd.Timestamp(candles[-1]["time"]).to_pydatetime()
+        print(f"  {last:%Y-%m-%d %H:%M}  {len(rows):,} candles", flush=True)
+        if last + timedelta(minutes=1) <= t:
+            break
+        t = last + timedelta(minutes=1)
+    cols = [f"{s}_{f}" for s in ("bid", "ask") for f in ("open", "high", "low", "close")]
+    bars = pd.DataFrame(rows, columns=["time", *cols, "ticks"])
+    bars.index = pd.to_datetime(bars.pop("time"), utc=True)
+    bars = bars[bars.index < pd.Timestamp(stop)]
+    DATA_DIR.mkdir(exist_ok=True)
+    for day, g in bars.groupby(bars.index.date):
+        g.to_csv(day_file(day), compression="gzip")
+
+
 def load_bars(start: str | None = None, end: str | None = None, rule: str = "1min") -> pd.DataFrame:
     """Load cached 1-minute bars, optionally resampled (e.g. '5min')."""
     files = sorted(DATA_DIR.glob("XAUUSD_*_1m.csv.gz"))
@@ -162,9 +199,11 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--start", default=(date.today() - timedelta(days=365)).isoformat())
     p.add_argument("--end", default=(date.today() - timedelta(days=1)).isoformat())
+    p.add_argument("--source", choices=["dukascopy", "oanda"], default="dukascopy")
     a = p.parse_args()
-    print(f"Downloading XAUUSD {a.start} .. {a.end}")
-    download(date.fromisoformat(a.start), date.fromisoformat(a.end))
+    print(f"Downloading XAUUSD {a.start} .. {a.end} from {a.source}")
+    fn = download_oanda if a.source == "oanda" else download
+    fn(date.fromisoformat(a.start), date.fromisoformat(a.end))
 
 
 if __name__ == "__main__":
