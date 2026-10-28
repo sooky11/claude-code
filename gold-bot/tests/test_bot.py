@@ -32,15 +32,17 @@ def make_bot(tmp_path, **kw):
                     state_dir=tmp_path)
 
 
-def test_buys_on_uptrend_and_sizes_by_risk(tmp_path):
-    bars = daily(np.arange(100, 130, 1.0))
+def test_buys_on_uptrend_at_next_open_and_sizes_by_risk(tmp_path):
+    bars = daily(np.arange(100, 131, 1.0), opens=np.arange(100, 131, 1.0) - 0.5)
     bot = make_bot(tmp_path)
+    bot.step(bars.iloc[:30])
+    assert bot.state["position"] is None and bot.state["pending"] is not None
     bot.step(bars)
     pos = bot.state["position"]
     assert pos is not None
-    assert pos["entry"] == pytest.approx(129 + SPREAD / 2)
+    assert pos["entry"] == pytest.approx(129.5 + SPREAD / 2)  # ask open of the next day
     # 1% of 10,000 = $100 risk; units = floor(100 / risk distance)
-    assert pos["units"] == int(100 // pos["risk"])
+    assert pos["units"] == pytest.approx(int(100 / pos["risk"] * 100) / 100)
     assert pos["stop"] == pytest.approx(pos["entry"] - pos["risk"], abs=1e-3)
 
 
@@ -56,11 +58,12 @@ def test_time_exit_after_hold_days_and_idempotent(tmp_path):
     bars = daily(np.concatenate([up, [130, 131, 132, 133]]))
     bot = make_bot(tmp_path)
     bot.step(bars.iloc[:30])
+    bot.step(bars.iloc[:31])
     assert bot.state["position"] is not None
     bot.step(bars)
     t = bot.trades()
     assert len(t) == 1 and t.iloc[0]["reason"] == "tijd"
-    assert t.iloc[0]["exit"] == pytest.approx(132 - SPREAD / 2)  # 3rd day after entry
+    assert t.iloc[0]["exit"] == pytest.approx(132 - SPREAD / 2)  # 3rd day held, counting the entry day
     # same data again -> nothing happens
     assert bot.step(bars) == []
     assert len(bot.trades()) == 1
@@ -69,11 +72,13 @@ def test_time_exit_after_hold_days_and_idempotent(tmp_path):
 def test_stop_and_gap_through_stop(tmp_path):
     up = np.arange(100, 130, 1.0)
     bot = make_bot(tmp_path)
+    up2 = np.concatenate([up, [130]])
     bot.step(daily(up))
+    bot.step(daily(up2))
     stop = bot.state["position"]["stop"]
     # next day opens far below the stop
-    crash = daily(np.concatenate([up, [110]]), lows=np.concatenate([up - 1, [105]]),
-                  opens=np.concatenate([up, [111]]))
+    crash = daily(np.concatenate([up2, [110]]), lows=np.concatenate([up2 - 1, [105]]),
+                  opens=np.concatenate([up2, [111]]))
     bot.step(crash)
     t = bot.trades()
     assert t.iloc[0]["reason"] == "stop"
@@ -84,5 +89,7 @@ def test_stop_and_gap_through_stop(tmp_path):
 def test_state_survives_restart(tmp_path):
     bot = make_bot(tmp_path)
     bot.step(daily(np.arange(100, 130, 1.0)))
+    bot.step(daily(np.arange(100, 131, 1.0)))
     again = make_bot(tmp_path)
+    assert again.state["position"] is not None
     assert again.state["position"] == bot.state["position"]

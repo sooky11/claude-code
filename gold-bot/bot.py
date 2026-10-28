@@ -83,7 +83,7 @@ class SwingBot:
     def _load(self) -> dict:
         if self.state_file.exists():
             return json.loads(self.state_file.read_text())
-        return {"position": None, "last_day": None, "equity": self.p.start_equity, "log": [],
+        return {"position": None, "pending": None, "last_day": None, "equity": self.p.start_equity, "log": [],
                 "params": asdict(self.p)}
 
     def save(self) -> None:
@@ -109,6 +109,12 @@ class SwingBot:
         self.state["equity"] = round(self.state["equity"] + pnl, 2)
 
     # ---------------------------------------------------------------- logic
+    def size(self, risk: float) -> float:
+        """Ounces so that hitting the stop costs risk_pct of equity. Paper trading
+        allows 0.01 oz; real OANDA orders need whole ounces (rounded down)."""
+        oz = self.state["equity"] * self.p.risk_pct / 100 / risk
+        return float(math.floor(oz)) if self.mode == "demo-orders" else math.floor(oz * 100) / 100
+
     def signal(self, daily: pd.DataFrame) -> dict:
         """Signal on the last completed day."""
         c = mid(daily, "close")
@@ -133,6 +139,15 @@ class SwingBot:
 
         for day in new_days:
             bar = daily.loc[day]
+            pend = self.state.get("pending")
+            if pend is not None:  # paper: fill yesterday's signal at today's open, like the backtest
+                entry = float(bar["ask_open"])
+                units = self.size(pend["risk"])
+                self.state["position"] = {"entry_time": str(day), "entry": entry,
+                                          "stop": round(entry - pend["risk"], 3), "risk": pend["risk"],
+                                          "units": units, "days_held": 0, "trade_id": None}
+                self.state["pending"] = None
+                self.log(day, f"GEKOCHT {units} oz @ {entry:.2f} (opening), stop {entry - pend['risk']:.2f}")
             pos = self.state["position"]
             exited = False
             if pos is not None:
@@ -154,25 +169,28 @@ class SwingBot:
                     self.log(day, f"positie dag {pos['days_held']}/{self.p.hold}, slot {bar['bid_close']:.2f}, "
                                   f"stop {pos['stop']:.2f}")
 
-            if self.state["position"] is None and not exited:
+            if self.state["position"] is None and self.state.get("pending") is None and not exited:
                 sig = self.signal(daily.loc[:day])
                 if sig["buy"]:
-                    entry = float(bar["ask_close"])  # ~ next open; live orders fill at market
                     risk = self.p.sl_atr * sig["atr"]
-                    units = math.floor(self.state["equity"] * self.p.risk_pct / 100 / risk)
-                    if units < 1:
-                        self.log(day, f"{sig['reason']}, maar positie < 1 oz bij dit risico")
+                    units = self.size(risk)
+                    if units <= 0:
+                        self.log(day, f"{sig['reason']}, maar de positie is te klein bij dit risico "
+                                      f"(stop ${risk:.0f}/oz)")
+                    elif self.mode == "demo-orders" and broker is not None:
+                        # live: market order right after the daily close (fills around the next open)
+                        bid, ask = broker.price()
+                        res = broker.market_order(units, round(ask - risk, 3))
+                        fill = res.get("orderFillTransaction", {})
+                        entry = float(fill.get("price", ask))
+                        self.state["position"] = {"entry_time": str(day), "entry": entry,
+                                                  "stop": round(entry - risk, 3), "risk": risk, "units": units,
+                                                  "days_held": 0,
+                                                  "trade_id": fill.get("tradeOpened", {}).get("tradeID")}
+                        self.log(day, f"{sig['reason']}: GEKOCHT {units} oz @ {entry:.2f} (OANDA)")
                     else:
-                        pos = {"entry_time": str(day), "entry": entry, "stop": round(entry - risk, 3),
-                               "risk": risk, "units": units, "days_held": 0, "trade_id": None}
-                        if self.mode == "demo-orders" and broker is not None:
-                            res = broker.market_order(units, pos["stop"])
-                            fill = res.get("orderFillTransaction", {})
-                            pos["entry"] = float(fill.get("price", entry))
-                            pos["trade_id"] = fill.get("tradeOpened", {}).get("tradeID")
-                        self.state["position"] = pos
-                        self.log(day, f"{sig['reason']}: GEKOCHT {units} oz @ {pos['entry']:.2f}, "
-                                      f"stop {pos['stop']:.2f}")
+                        self.state["pending"] = {"signal_day": str(day), "risk": risk}
+                        self.log(day, f"{sig['reason']}: koop bij de volgende opening")
                 else:
                     self.log(day, sig["reason"])
             self.state["last_day"] = str(day)
