@@ -1,0 +1,5 @@
+data/
+report.html
+report.json
+.env
+__pycache__/
