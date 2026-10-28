@@ -159,12 +159,15 @@ def download_hourly(start: date, end: date) -> None:
                 bars = sides["bid"].join(sides["ask"], how="inner")
                 bars["ticks"] = (bars["bid_vol"] + bars["ask_vol"] > 0).astype(int)
                 bars[bars["ticks"] > 0].drop(columns=["bid_vol", "ask_vol"]).to_csv(path, compression="gzip")
+            elif nxt <= date.today() - timedelta(days=1):
+                pd.DataFrame().to_csv(path, compression="gzip")  # no data for this month: don't ask again
             print(f"  {m:%Y-%m}", flush=True)
         m = nxt
 
 
 def load_hourly(start: str | None = None, end: str | None = None) -> pd.DataFrame:
-    frames = [pd.read_csv(f, index_col=0, parse_dates=True) for f in sorted(HOURLY_DIR.glob("*_1h.csv.gz"))]
+    frames = [pd.read_csv(f, index_col=0, parse_dates=True) for f in sorted(HOURLY_DIR.glob("*_1h.csv.gz"))
+              if f.stat().st_size > 40]
     bars = pd.concat([f for f in frames if not f.empty]).sort_index()
     if start:
         bars = bars[bars.index >= pd.Timestamp(start, tz="UTC")]

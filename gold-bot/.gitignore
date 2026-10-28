@@ -1,5 +1,6 @@
+.env
+__pycache__/
 data/
 report.html
 report.json
-.env
-__pycache__/
+state/
