@@ -131,6 +131,48 @@ def download(start: date, end: date) -> None:
             print(f"  {i}/{len(days)} days", flush=True)
 
 
+HOURLY_DIR = DATA_DIR / "hourly"
+
+
+def download_hourly(start: date, end: date) -> None:
+    """Monthly files of 1-hour bid/ask candles (1 request per side per month).
+    URL: .../XAUUSD/YYYY/MM/{BID,ASK}_candles_hour_1.bi5, time = seconds into the month."""
+    HOURLY_DIR.mkdir(parents=True, exist_ok=True)
+    m = date(start.year, start.month, 1)
+    while m <= end:
+        path = HOURLY_DIR / f"XAUUSD_{m:%Y-%m}_1h.csv.gz"
+        nxt = date(m.year + m.month // 12, m.month % 12 + 1, 1)
+        if not path.exists() or nxt > date.today() - timedelta(days=1):
+            sides = {}
+            base = f"https://datafeed.dukascopy.com/datafeed/XAUUSD/{m.year}/{m.month - 1:02d}/"
+            for side in ("BID", "ASK"):
+                raw = fetch(base + f"{side}_candles_hour_1.bi5")
+                if raw is None:
+                    break
+                a = np.frombuffer(raw, dtype=CANDLE).astype(CANDLE.newbyteorder("="))
+                idx = pd.Timestamp(m, tz="UTC") + pd.to_timedelta(a["t"].astype(np.int64), unit="s")
+                s = side.lower()
+                sides[s] = pd.DataFrame({f"{s}_open": a["o"] / POINT, f"{s}_high": a["h"] / POINT,
+                                         f"{s}_low": a["l"] / POINT, f"{s}_close": a["c"] / POINT,
+                                         f"{s}_vol": a["v"]}, index=idx)
+            if len(sides) == 2:
+                bars = sides["bid"].join(sides["ask"], how="inner")
+                bars["ticks"] = (bars["bid_vol"] + bars["ask_vol"] > 0).astype(int)
+                bars[bars["ticks"] > 0].drop(columns=["bid_vol", "ask_vol"]).to_csv(path, compression="gzip")
+            print(f"  {m:%Y-%m}", flush=True)
+        m = nxt
+
+
+def load_hourly(start: str | None = None, end: str | None = None) -> pd.DataFrame:
+    frames = [pd.read_csv(f, index_col=0, parse_dates=True) for f in sorted(HOURLY_DIR.glob("*_1h.csv.gz"))]
+    bars = pd.concat([f for f in frames if not f.empty]).sort_index()
+    if start:
+        bars = bars[bars.index >= pd.Timestamp(start, tz="UTC")]
+    if end:
+        bars = bars[bars.index < pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1)]
+    return bars
+
+
 OANDA_URL = "https://api-fxpractice.oanda.com/v3/instruments/XAU_USD/candles"
 
 
@@ -199,10 +241,10 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--start", default=(date.today() - timedelta(days=365)).isoformat())
     p.add_argument("--end", default=(date.today() - timedelta(days=1)).isoformat())
-    p.add_argument("--source", choices=["dukascopy", "oanda"], default="dukascopy")
+    p.add_argument("--source", choices=["dukascopy", "oanda", "hourly"], default="dukascopy")
     a = p.parse_args()
     print(f"Downloading XAUUSD {a.start} .. {a.end} from {a.source}")
-    fn = download_oanda if a.source == "oanda" else download
+    fn = {"oanda": download_oanda, "hourly": download_hourly}.get(a.source, download)
     fn(date.fromisoformat(a.start), date.fromisoformat(a.end))
 
 

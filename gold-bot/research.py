@@ -31,6 +31,7 @@ import strategies
 from strategies import GRIDS, STRATEGIES, flat_mask
 
 MIN_TRAIN_TRADES = 30
+BASE = Costs()  # set from --spread-mult / --commission
 
 CRITERIA = {
     "min_trades": 100,          # holdout trades
@@ -63,8 +64,9 @@ def key(p: dict) -> tuple:
     return tuple(sorted(p.items()))
 
 
-def run_all(name: str, bars: pd.DataFrame, flat: np.ndarray, costs: Costs = Costs()) -> dict:
+def run_all(name: str, bars: pd.DataFrame, flat: np.ndarray, costs: Costs | None = None) -> dict:
     fn = STRATEGIES[name]
+    costs = costs or BASE
     return {key(p): run(bars, fn(bars, **p), flat, costs) for p in combos(GRIDS[name])}
 
 
@@ -156,8 +158,10 @@ def evaluate(name: str, bars: pd.DataFrame, flat: np.ndarray, holdout_start) -> 
 
     fn = STRATEGIES[name]
     stress = {}
-    for label, c in {"spread x1.5": Costs(spread_mult=1.5), "spread x2": Costs(spread_mult=2.0),
-                     "slippage $0.10": Costs(slippage=0.10)}.items():
+    b = BASE
+    for label, c in {"spread x1.5": Costs(b.spread_mult * 1.5, b.slippage, b.commission),
+                     "spread x2": Costs(b.spread_mult * 2.0, b.slippage, b.commission),
+                     "slippage $0.10": Costs(b.spread_mult, b.slippage + 0.10, b.commission)}.items():
         stress[label] = stats(window(run(bars, fn(bars, **params), flat, c), holdout_start, end))
 
     sens = sensitivity(name, results, params, holdout_start, end)
@@ -266,15 +270,26 @@ def main() -> None:
     ap.add_argument("--rule", default="5min", help="bar size: 5min, 15min, 1h")
     ap.add_argument("--start", default="2025-10-27", help="first day of the research period")
     ap.add_argument("--end", default=None, help="last day of the research period")
+    ap.add_argument("--source", choices=["minute", "hourly"], default="minute",
+                    help="minute: 1-min candles (last 2 years); hourly: 1-hour candles since 2008")
+    ap.add_argument("--spread-mult", type=float, default=1.0, help="scale recorded spread (0.3 ~ ECN raw)")
+    ap.add_argument("--commission", type=float, default=0.0, help="$/oz per round trip")
     ap.add_argument("--entry-hours", default="7-19", help="UTC hours for new entries, e.g. 13-16")
     a = ap.parse_args()
 
+    global BASE
+    BASE = Costs(spread_mult=a.spread_mult, commission=a.commission)
     strategies.ENTRY_HOURS = tuple(int(h) for h in a.entry_hours.split("-"))
-    bars = data.load_bars(a.start, a.end, rule=a.rule)
+    if a.source == "hourly":
+        bars = data.load_hourly(a.start, a.end)
+        if a.rule != "1h":
+            bars = data.resample(bars, a.rule)
+    else:
+        bars = data.load_bars(a.start, a.end, rule=a.rule)
     flat = flat_mask(bars, bar_minutes=int(pd.Timedelta(a.rule).total_seconds() // 60))
     holdout_start = (bars.index[-1] - pd.Timedelta(days=a.holdout_days)).normalize()
     results = [evaluate(n, bars, flat, holdout_start) for n in a.strategies]
-    write_report(results, bars, holdout_start, Path(a.report), f"{a.rule}, entries {a.entry_hours} UTC,")
+    write_report(results, bars, holdout_start, Path(a.report), f"{a.rule}, entries {a.entry_hours} UTC, spread x{a.spread_mult}, commission ${a.commission}/oz,")
 
     summary = {r["name"]: {"passed": r["passed"], "params": r["params"], "holdout": r["holdout"],
                            "walk_forward": r["walk_forward"], "checks": r["checks"],

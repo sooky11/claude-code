@@ -52,6 +52,17 @@ def flat_mask(bars: pd.DataFrame, bar_minutes: int = 5) -> np.ndarray:
     return np.asarray(end | gap)
 
 
+def bar_delta(bars: pd.DataFrame) -> pd.Timedelta:
+    return pd.Series(bars.index[1:200] - bars.index[:199]).min()
+
+
+def crosses(t0, t1, hh: int, mm: int) -> np.ndarray:
+    """Bars that start before hh:mm and end at or after it (local times t0/t1)."""
+    x = hh * 60 + mm
+    return np.asarray(((t0.hour * 60 + t0.minute) < x) & ((t1.hour * 60 + t1.minute) >= x)
+                      | ((t1.hour * 60 + t1.minute) < (t0.hour * 60 + t0.minute)) & (x > t0.hour * 60 + t0.minute))
+
+
 def _finish(bars, long_, short_, sl_atr, tp_atr, max_bars) -> Signals:
     a = atr(bars).to_numpy()
     ok = entry_window(bars)
@@ -128,14 +139,15 @@ def session_drift(bars, mode="both", long_start=23, long_hours=3, short_start=13
     `short_hours`; exits on time or on a protective ATR stop. 5-minute bars.
     """
     idx = bars.index
-    nxt = idx + pd.Timedelta(minutes=5)
+    step = bar_delta(bars)
+    nxt = idx + step
     at = lambda h: (nxt.hour == h % 24) & (nxt.minute == 0)  # bar closing right at h:00
     long_ = at(long_start) if mode in ("both", "long") else np.zeros(len(bars), bool)
     short_ = at(short_start) if mode in ("both", "short") else np.zeros(len(bars), bool)
     a = atr(bars).to_numpy()
     side = np.where(long_, 1, np.where(short_, -1, 0))
     side[:200] = 0
-    hold = np.where(side > 0, long_hours, short_hours) * 12
+    hold = (np.where(side > 0, long_hours, short_hours) * (pd.Timedelta(hours=1) / step)).astype(int)
     # one Signals object needs one max_bars: encode per-trade hold via flat bars
     flat = np.append((idx[1:] - idx[:-1]) > pd.Timedelta(minutes=30), True)
     exit_bars = np.zeros(len(bars), bool)
@@ -177,11 +189,11 @@ def ny_fade(bars, ref="london", entry="09:30", exit_="15:55", min_move_atr=0.0, 
     """
     c = mid(bars, "close")
     ny = bars.index.tz_convert("America/New_York")
-    nxt = ny + pd.Timedelta(minutes=5)
+    nxt = ny + bar_delta(bars)
     hh, mm = map(int, entry.split(":"))
     xh, xm = map(int, exit_.split(":"))
     sig_bar = (nxt.hour == hh) & (nxt.minute == mm)       # bar closing at entry time
-    exit_bar = (nxt.hour == xh) & (nxt.minute == xm)
+    exit_bar = crosses(ny, nxt, xh, xm)
     # reference price: close of the bar ending at the reference time (same NY trading day)
     rh, roll = (3, 0) if ref == "london" else (18, 1)
     ref_bar = (nxt.hour == rh) & (nxt.minute == 0)
@@ -251,7 +263,7 @@ def vol_breakout(bars, open_ref="globex", k=0.5, exit_="15:55", sl_atr=10.0, tp_
     today's open (Globex 18:00 NY, or London 03:00 NY); hold until `exit_` NY time."""
     c = mid(bars, "close")
     ny = bars.index.tz_convert("America/New_York")
-    nxt = ny + pd.Timedelta(minutes=5)
+    nxt = ny + bar_delta(bars)
     day = (ny + pd.Timedelta(hours=6)).normalize().tz_localize(None)  # trading day starts 18:00 NY
     g = pd.DataFrame({"h": mid(bars, "high").to_numpy(), "l": mid(bars, "low").to_numpy(),
                       "o": mid(bars, "open").to_numpy(), "day": day})
@@ -274,7 +286,7 @@ def vol_breakout(bars, open_ref="globex", k=0.5, exit_="15:55", sl_atr=10.0, tp_
     a = atr(bars).to_numpy()
     side = np.where(long_, 1, np.where(short_, -1, 0))
     side[:300] = 0
-    exit_bar = (nxt.hour == xh) & (nxt.minute == xm)
+    exit_bar = crosses(ny, nxt, xh, xm)
     flat = np.append((bars.index[1:] - bars.index[:-1]) > pd.Timedelta(minutes=30), True)
     return Signals(side=side, sl_dist=a * sl_atr, tp_dist=a * tp_atr, max_bars=10_000, flat=flat | exit_bar)
 
