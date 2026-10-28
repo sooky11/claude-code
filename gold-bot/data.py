@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import lzma
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -29,7 +30,7 @@ DATA_DIR = Path(__file__).parent / "data"
 
 def fetch_hour(session: requests.Session, day: date, hour: int) -> pd.DataFrame:
     url = URL.format(y=day.year, m=day.month - 1, d=day.day, h=hour)
-    for attempt in range(4):
+    for attempt in range(8):
         try:
             r = session.get(url, timeout=30)
             if r.status_code == 404:
@@ -37,8 +38,9 @@ def fetch_hour(session: requests.Session, day: date, hour: int) -> pd.DataFrame:
             r.raise_for_status()
             break
         except requests.RequestException:
-            if attempt == 3:
+            if attempt == 7:
                 raise
+            time.sleep(min(2 ** attempt, 60))  # back off on rate limits (429) and network errors
     if not r.content:
         return pd.DataFrame()
     raw = lzma.decompress(r.content)
@@ -79,7 +81,7 @@ def download_day(day: date) -> Path | None:
     return path
 
 
-def download(start: date, end: date, workers: int = 8) -> None:
+def download(start: date, end: date, workers: int = 3) -> None:
     days = [start + timedelta(d) for d in range((end - start).days + 1)]
     with ThreadPoolExecutor(workers) as ex:
         for i, _ in enumerate(ex.map(download_day, days), 1):
