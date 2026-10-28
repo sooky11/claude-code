@@ -14,6 +14,7 @@ from engine import Signals
 
 SESSION_START_UTC = 7    # London open
 SESSION_END_UTC = 20     # flat by 20:00 UTC (before the daily break)
+ENTRY_HOURS = (SESSION_START_UTC, SESSION_END_UTC - 1)  # [start, end) UTC hours for new entries
 
 
 def mid(bars: pd.DataFrame, f: str) -> pd.Series:
@@ -38,16 +39,16 @@ def rsi(s: pd.Series, n: int) -> pd.Series:
 
 
 def entry_window(bars: pd.DataFrame) -> np.ndarray:
-    """New entries allowed from London open until one hour before session end."""
+    """New entries allowed within ENTRY_HOURS (default: London open until 19:00 UTC)."""
     h = bars.index.hour
-    return (h >= SESSION_START_UTC) & (h < SESSION_END_UTC - 1)
+    return (h >= ENTRY_HOURS[0]) & (h < ENTRY_HOURS[1])
 
 
 def flat_mask(bars: pd.DataFrame, bar_minutes: int = 5) -> np.ndarray:
     """Bars at whose close any open position must be closed."""
     idx = bars.index
     end = (idx + pd.Timedelta(minutes=bar_minutes)).hour >= SESSION_END_UTC
-    gap = np.append((idx[1:] - idx[:-1]) > pd.Timedelta(minutes=30), True)
+    gap = np.append((idx[1:] - idx[:-1]) > pd.Timedelta(minutes=max(30, 2 * bar_minutes)), True)
     return np.asarray(end | gap)
 
 

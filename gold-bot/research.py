@@ -27,6 +27,7 @@ import pandas as pd
 
 import data
 from engine import Costs, run, stats
+import strategies
 from strategies import GRIDS, STRATEGIES, flat_mask
 
 MIN_TRAIN_TRADES = 30
@@ -142,7 +143,7 @@ def sensitivity(name: str, results: dict, p: dict, start, end) -> pd.DataFrame:
 
 
 def evaluate(name: str, bars: pd.DataFrame, flat: np.ndarray, holdout_start) -> dict:
-    start, end = bars.index[0], bars.index[-1] + pd.Timedelta(minutes=5)
+    start, end = bars.index[0], bars.index[-1] + pd.Timedelta(days=1)
     print(f"[{name}] backtesting {len(combos(GRIDS[name]))} parameter sets ...")
     results = run_all(name, bars, flat)
 
@@ -214,14 +215,14 @@ def _fmt(s: dict) -> str:
             f"{s['pnl']:+.0f} $/oz · {s['ret_pct']:+.1f}% @0.5% risk")
 
 
-def write_report(results: list[dict], bars: pd.DataFrame, holdout_start, path: Path) -> None:
+def write_report(results: list[dict], bars: pd.DataFrame, holdout_start, path: Path, setup: str) -> None:
     parts = [f"""<!doctype html><html lang="nl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>XAUUSD strategy research</title>
 <style>body{{font:14px/1.5 system-ui,sans-serif;max-width:960px;margin:24px auto;padding:0 16px;color:#222}}
 table{{border-collapse:collapse;margin:8px 0}}td,th{{border:1px solid #ddd;padding:3px 8px;text-align:right}}
 .pass{{color:#0a7a2f}}.fail{{color:#b3261e}}img{{max-width:100%}}section{{border-top:2px solid #eee;margin-top:24px}}</style>
 </head><body><h1>XAUUSD scalping: strategy research</h1>
-<p>Data: Dukascopy XAUUSD, {bars.index[0]:%Y-%m-%d} – {bars.index[-1]:%Y-%m-%d}, 5-min bid/ask bars
+<p>Data: Dukascopy XAUUSD, {bars.index[0]:%Y-%m-%d} – {bars.index[-1]:%Y-%m-%d}, {setup} bid/ask bars
 ({len(bars):,} bars). Holdout (last 6 months, never used to pick parameters): from {holdout_start:%Y-%m-%d}.
 Fills at next bar open at bid/ask; real spread included; SL first if SL and TP hit in one bar.</p>
 <h2>Summary</h2><table><tr><th>strategy</th><th>holdout</th><th>walk-forward (last 6m)</th><th>verdict</th></tr>"""]
@@ -262,13 +263,16 @@ def main() -> None:
     ap.add_argument("--holdout-days", type=int, default=182)
     ap.add_argument("--report", default=str(Path(__file__).parent / "report.html"))
     ap.add_argument("--strategies", nargs="*", default=list(STRATEGIES))
+    ap.add_argument("--rule", default="5min", help="bar size: 5min, 15min, 1h")
+    ap.add_argument("--entry-hours", default="7-19", help="UTC hours for new entries, e.g. 13-16")
     a = ap.parse_args()
 
-    bars = data.load_bars(rule="5min")
-    flat = flat_mask(bars)
+    strategies.ENTRY_HOURS = tuple(int(h) for h in a.entry_hours.split("-"))
+    bars = data.load_bars(rule=a.rule)
+    flat = flat_mask(bars, bar_minutes=int(pd.Timedelta(a.rule).total_seconds() // 60))
     holdout_start = (bars.index[-1] - pd.Timedelta(days=a.holdout_days)).normalize()
     results = [evaluate(n, bars, flat, holdout_start) for n in a.strategies]
-    write_report(results, bars, holdout_start, Path(a.report))
+    write_report(results, bars, holdout_start, Path(a.report), f"{a.rule}, entries {a.entry_hours} UTC,")
 
     summary = {r["name"]: {"passed": r["passed"], "params": r["params"], "holdout": r["holdout"],
                            "walk_forward": r["walk_forward"], "checks": r["checks"],
