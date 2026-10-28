@@ -1,13 +1,21 @@
-"""Download XAUUSD tick data from Dukascopy and build bid/ask candles.
+"""Download XAUUSD prices from Dukascopy and store 1-minute bid/ask candles.
 
-Dukascopy serves one LZMA-compressed .bi5 file per hour:
-    https://datafeed.dukascopy.com/datafeed/XAUUSD/YYYY/MM/DD/HHh_ticks.bi5
-where MM is zero-based (January = 00). Each tick is a 20-byte big-endian
-record: ms offset in the hour (uint32), ask (uint32), bid (uint32),
-ask volume (float32), bid volume (float32). XAUUSD prices are stored * 1000.
+Dukascopy serves LZMA-compressed .bi5 files; MM in the URL is zero-based
+(January = 00) and XAUUSD prices are stored * 1000.
+
+- Daily minute candles (2 requests per day, used by default):
+    .../XAUUSD/YYYY/MM/DD/{BID,ASK}_candles_min_1.bi5
+  24-byte records: seconds into the day (uint32), open, close, low, high
+  (uint32), volume (float32).
+- Hourly ticks (fallback for recent days that have no candle file yet):
+    .../XAUUSD/YYYY/MM/DD/HHh_ticks.bi5
+  20-byte records: ms into the hour, ask, bid (uint32), ask/bid volume (float32).
+
+Dukascopy rate-limits aggressively, so requests run one at a time with a
+pause, and a 429 backs off for up to several minutes.
 
 Usage:
-    python data.py --start 2025-10-01 --end 2026-10-28
+    python data.py --start 2025-10-27 --end 2026-10-27
 """
 
 from __future__ import annotations
@@ -15,7 +23,6 @@ from __future__ import annotations
 import argparse
 import lzma
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,32 +30,66 @@ import numpy as np
 import pandas as pd
 import requests
 
-URL = "https://datafeed.dukascopy.com/datafeed/XAUUSD/{y}/{m:02d}/{d:02d}/{h:02d}h_ticks.bi5"
+BASE = "https://datafeed.dukascopy.com/datafeed/XAUUSD/{y}/{m:02d}/{d:02d}/"
 POINT = 1000.0
 DATA_DIR = Path(__file__).parent / "data"
+PAUSE = 1.0  # seconds between requests
+
+CANDLE = np.dtype([("t", ">u4"), ("o", ">u4"), ("c", ">u4"), ("l", ">u4"), ("h", ">u4"), ("v", ">f4")])
+TICK = np.dtype([("ms", ">u4"), ("ask", ">u4"), ("bid", ">u4"), ("askv", ">f4"), ("bidv", ">f4")])
+
+_session = requests.Session()
 
 
-def fetch_hour(session: requests.Session, day: date, hour: int) -> pd.DataFrame:
-    url = URL.format(y=day.year, m=day.month - 1, d=day.day, h=hour)
-    for attempt in range(8):
+def _url(day: date, name: str) -> str:
+    return BASE.format(y=day.year, m=day.month - 1, d=day.day) + name
+
+
+def fetch(url: str) -> bytes | None:
+    """GET a .bi5 file; None if it does not exist. Retries with long back-off."""
+    for attempt in range(10):
+        time.sleep(PAUSE)
         try:
-            r = session.get(url, timeout=30)
+            r = _session.get(url, timeout=30)
             if r.status_code == 404:
-                return pd.DataFrame()
+                return None
             r.raise_for_status()
-            break
+            return lzma.decompress(r.content) if r.content else b""
         except requests.RequestException:
-            if attempt == 7:
+            if attempt == 9:
                 raise
-            time.sleep(min(2 ** attempt, 60))  # back off on rate limits (429) and network errors
-    if not r.content:
+            time.sleep(min(15 * 2 ** attempt, 300))  # rate limit (429) or dropped connection
+    return None
+
+
+def fetch_day_candles(day: date) -> pd.DataFrame | None:
+    """1-minute bid/ask candles for one UTC day; None if Dukascopy has no file."""
+    sides = {}
+    for side in ("BID", "ASK"):
+        raw = fetch(_url(day, f"{side}_candles_min_1.bi5"))
+        if raw is None:
+            return None
+        a = np.frombuffer(raw, dtype=CANDLE)
+        idx = pd.Timestamp(day, tz="UTC") + pd.to_timedelta(a["t"].astype(np.int64), unit="s")
+        s = side.lower()
+        sides[s] = pd.DataFrame({f"{s}_open": a["o"] / POINT, f"{s}_high": a["h"] / POINT,
+                                 f"{s}_low": a["l"] / POINT, f"{s}_close": a["c"] / POINT,
+                                 f"{s}_vol": a["v"]}, index=idx)
+    bars = sides["bid"].join(sides["ask"], how="inner")
+    # Dukascopy fills closed-market minutes with flat zero-volume candles
+    bars["ticks"] = (bars["bid_vol"] + bars["ask_vol"] > 0).astype(int)
+    bars = bars[bars["ticks"] > 0].drop(columns=["bid_vol", "ask_vol"])
+    return bars
+
+
+def fetch_hour_ticks(day: date, hour: int) -> pd.DataFrame:
+    raw = fetch(_url(day, f"{hour:02d}h_ticks.bi5"))
+    if not raw:
         return pd.DataFrame()
-    raw = lzma.decompress(r.content)
-    arr = np.frombuffer(raw, dtype=np.dtype([("ms", ">u4"), ("ask", ">u4"), ("bid", ">u4"),
-                                             ("askv", ">f4"), ("bidv", ">f4")]))
-    base = datetime(day.year, day.month, day.day, hour, tzinfo=timezone.utc)
-    idx = pd.to_datetime(base) + pd.to_timedelta(arr["ms"].astype(np.int64), unit="ms")
-    return pd.DataFrame({"ask": arr["ask"] / POINT, "bid": arr["bid"] / POINT}, index=idx)
+    a = np.frombuffer(raw, dtype=TICK)
+    base = pd.Timestamp(datetime(day.year, day.month, day.day, hour, tzinfo=timezone.utc))
+    idx = base + pd.to_timedelta(a["ms"].astype(np.int64), unit="ms")
+    return pd.DataFrame({"ask": a["ask"] / POINT, "bid": a["bid"] / POINT}, index=idx)
 
 
 def ticks_to_bars(ticks: pd.DataFrame, rule: str = "1min") -> pd.DataFrame:
@@ -72,21 +113,21 @@ def download_day(day: date) -> Path | None:
         return path
     if day.weekday() == 5:  # Saturday: market closed
         return None
-    with requests.Session() as s:
-        parts = [fetch_hour(s, day, h) for h in range(24)]
-    parts = [p for p in parts if not p.empty]
-    bars = ticks_to_bars(pd.concat(parts)) if parts else pd.DataFrame()
+    bars = fetch_day_candles(day)
+    if bars is None:
+        parts = [p for p in (fetch_hour_ticks(day, h) for h in range(24)) if not p.empty]
+        bars = ticks_to_bars(pd.concat(parts)) if parts else pd.DataFrame()
     DATA_DIR.mkdir(exist_ok=True)
     bars.to_csv(path, compression="gzip")
     return path
 
 
-def download(start: date, end: date, workers: int = 3) -> None:
+def download(start: date, end: date) -> None:
     days = [start + timedelta(d) for d in range((end - start).days + 1)]
-    with ThreadPoolExecutor(workers) as ex:
-        for i, _ in enumerate(ex.map(download_day, days), 1):
-            if i % 20 == 0 or i == len(days):
-                print(f"  {i}/{len(days)} days")
+    for i, day in enumerate(days, 1):
+        download_day(day)
+        if i % 20 == 0 or i == len(days):
+            print(f"  {i}/{len(days)} days", flush=True)
 
 
 def load_bars(start: str | None = None, end: str | None = None, rule: str = "1min") -> pd.DataFrame:
